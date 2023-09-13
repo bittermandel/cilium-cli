@@ -230,6 +230,23 @@ func Run(ctx context.Context, ct *check.ConnectivityTest, addExtraTests func(*ch
 		ct.NewTest("no-missed-tail-calls").WithScenarios(tests.NoMissedTailCalls())
 	}
 
+	if ct.Params().Short {
+		// Run all tests without any policies in place.
+		noPoliciesScenarios := []check.Scenario{
+			tests.PodToPod(),
+			tests.ClientToClient(),
+			tests.PodToService(),
+			tests.PodToHostPort(),
+			tests.PodToWorld(tests.WithRetryAll()),
+			tests.PodToHost(),
+			tests.PodToExternalWorkload(),
+			tests.PodToCIDR(tests.WithRetryAll()),
+		}
+
+		ct.NewTest("no-policies").WithScenarios(noPoliciesScenarios...)
+		return ct.Run(ctx)
+	}
+
 	// Run all tests without any policies in place.
 	noPoliciesScenarios := []check.Scenario{
 		tests.PodToPod(),
