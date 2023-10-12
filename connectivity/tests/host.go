@@ -62,6 +62,52 @@ func (s *podToHost) Run(ctx context.Context, t *check.Test) {
 	}
 }
 
+// PodToControlPlaneHost sends an ICMP ping from the controlPlaneclient Pod to all nodes
+// in the test context.
+func PodToControlPlaneHost() check.Scenario {
+	return &podToControlPlaneHost{}
+}
+
+// podToHost implements a Scenario.
+type podToControlPlaneHost struct{}
+
+func (s *podToControlPlaneHost) Name() string {
+	return "pod-to-controlplane-host"
+}
+
+func (s *podToControlPlaneHost) Run(ctx context.Context, t *check.Test) {
+
+	ct := t.Context()
+	var i int
+	pod := ct.ControlPlaneClientPod()
+	for _, node := range ct.Nodes() {
+		if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; !ok {
+			continue
+		}
+		t.ForEachIPFamily(func(ipFam features.IPFamily) {
+			for _, addr := range node.Status.Addresses {
+				if features.GetIPFamily(addr.Address) != ipFam {
+					continue
+				}
+
+				dst := check.ICMPEndpoint("", addr.Address)
+				ipFam := features.GetIPFamily(addr.Address)
+
+				t.NewAction(s, fmt.Sprintf("ping-%s-%d", ipFam, i), pod, dst, ipFam).Run(func(a *check.Action) {
+					a.ExecInPod(ctx, ct.PingCommand(dst, ipFam))
+
+					a.ValidateFlows(ctx, pod, a.GetEgressRequirements(check.FlowParameters{
+						Protocol: check.ICMP,
+					}))
+
+					a.ValidateMetrics(ctx, *pod, a.GetEgressMetricsRequirements())
+				})
+			}
+		})
+		i++
+	}
+}
+
 // PodToHostPort sends an HTTP request from all client Pods
 // to all echo Services' HostPorts.
 func PodToHostPort() check.Scenario {

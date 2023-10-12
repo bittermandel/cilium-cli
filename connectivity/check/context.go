@@ -61,11 +61,13 @@ type ConnectivityTest struct {
 	echoPods          map[string]Pod
 	echoExternalPods  map[string]Pod
 	clientPods        map[string]Pod
+	clientCPPod       *Pod
 	perfClientPods    map[string]Pod
 	perfServerPod     map[string]Pod
 	PerfResults       map[PerfTests]PerfResult
 	echoServices      map[string]Service
 	ingressService    map[string]Service
+	k8sService        Service
 	externalWorkloads map[string]ExternalWorkload
 
 	hostNetNSPodsByNode      map[string]Pod
@@ -96,6 +98,29 @@ type PerfResult struct {
 	Samples  int
 	Values   []float64
 	Avg      float64
+}
+
+func netIPToCIDRs(netIPs []netip.Addr) (netCIDRs []netip.Prefix) {
+	for _, ip := range netIPs {
+		found := false
+		for _, cidr := range netCIDRs {
+			if cidr.Addr().Is4() == ip.Is4() && cidr.Contains(ip) {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
+		// Generate a /24 or /64 accordingly
+		bits := 24
+		if ip.Is6() {
+			bits = 64
+		}
+		netCIDRs = append(netCIDRs, netip.PrefixFrom(ip, bits).Masked())
+	}
+	return
 }
 
 // verbose returns the value of the user-provided verbosity flag.
@@ -334,6 +359,11 @@ func (ct *ConnectivityTest) SetupAndValidate(ctx context.Context, setupAndValida
 	if match, _ := ct.Features.MatchRequirements((features.RequireEnabled(features.CIDRMatchNodes))); match {
 		if err := ct.detectNodeCIDRs(ctx); err != nil {
 			return fmt.Errorf("unable to detect node CIDRs: %w", err)
+		}
+	}
+	if ct.params.K8sLocalHostTest {
+		if err := ct.detectK8sCIDR(ctx); err != nil {
+			return fmt.Errorf("unable to detect K8s CIDR: %w", err)
 		}
 	}
 	return nil
@@ -639,6 +669,7 @@ func (ct *ConnectivityTest) detectNodeCIDRs(ctx context.Context) error {
 	}
 
 	nodeIPs := make([]netip.Addr, 0, len(nodes.Items))
+	cpIPs := make([]netip.Addr, 0, 1)
 
 	for _, node := range nodes.Items {
 		for _, addr := range node.Status.Addresses {
@@ -651,6 +682,10 @@ func (ct *ConnectivityTest) detectNodeCIDRs(ctx context.Context) error {
 				continue
 			}
 			nodeIPs = append(nodeIPs, ip)
+			if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
+				cpIPs = append(cpIPs, ip)
+
+			}
 		}
 	}
 
@@ -659,33 +694,44 @@ func (ct *ConnectivityTest) detectNodeCIDRs(ctx context.Context) error {
 	}
 
 	// collapse set of IPs in to CIDRs
-	nodeCIDRs := []netip.Prefix{}
-
-	for _, ip := range nodeIPs {
-		found := false
-		for _, cidr := range nodeCIDRs {
-			if cidr.Addr().Is4() == ip.Is4() && cidr.Contains(ip) {
-				found = true
-				break
-			}
-		}
-		if found {
-			continue
-		}
-
-		// Generate a /24 or /64 accordingly
-		bits := 24
-		if ip.Is6() {
-			bits = 64
-		}
-		nodeCIDRs = append(nodeCIDRs, netip.PrefixFrom(ip, bits).Masked())
-	}
+	nodeCIDRs := netIPToCIDRs(nodeIPs)
+	cpCIDRs := netIPToCIDRs(cpIPs)
 
 	ct.params.NodeCIDRs = make([]string, 0, len(nodeCIDRs))
 	for _, cidr := range nodeCIDRs {
 		ct.params.NodeCIDRs = append(ct.params.NodeCIDRs, cidr.String())
 	}
+
+	ct.params.ControlPlaneCIDRs = make([]string, 0, len(cpCIDRs))
+	for _, cidr := range cpCIDRs {
+		ct.params.ControlPlaneCIDRs = append(ct.params.ControlPlaneCIDRs, cidr.String())
+	}
+
 	ct.Debugf("Detected NodeCIDRs: %v", ct.params.NodeCIDRs)
+	ct.Debugf("Detected ControlPlaneCIDRs: %v", ct.params.ControlPlaneCIDRs)
+	return nil
+}
+
+// detectK8sCIDR produces one CIDR that covers the kube-apiserver address.
+// ipv4 addresses are collapsed in to one or more /24s, and v6 to one or more /64s
+func (ct *ConnectivityTest) detectK8sCIDR(ctx context.Context) error {
+	service, err := ct.client.GetService(ctx, "default", "kubernetes", metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get \"kubernetes.default\" service: %w", err)
+	}
+	addr, err := netip.ParseAddr(service.Spec.ClusterIP)
+	if err != nil {
+		return fmt.Errorf("failed to parse \"kubernetes.default\" service Cluster IP: %w", err)
+	}
+
+	// Generate a /24 or /64 accordingly
+	bits := 24
+	if addr.Is6() {
+		bits = 64
+	}
+	ct.params.K8sCIDR = netip.PrefixFrom(addr, bits).Masked().String()
+	ct.k8sService = Service{Service: service, URLPath: "/healthz"}
+	ct.Debugf("Detected K8sCIDR: %q", ct.params.K8sCIDR)
 	return nil
 }
 
@@ -948,6 +994,10 @@ func (ct *ConnectivityTest) RandomClientPod() *Pod {
 	return nil
 }
 
+func (ct *ConnectivityTest) ControlPlaneClientPod() *Pod {
+	return ct.clientCPPod
+}
+
 func (ct *ConnectivityTest) Params() Parameters {
 	return ct.params
 }
@@ -998,6 +1048,10 @@ func (ct *ConnectivityTest) ExternalEchoPods() map[string]Pod {
 
 func (ct *ConnectivityTest) IngressService() map[string]Service {
 	return ct.ingressService
+}
+
+func (ct *ConnectivityTest) K8sService() Service {
+	return ct.k8sService
 }
 
 func (ct *ConnectivityTest) ExternalWorkloads() map[string]ExternalWorkload {
