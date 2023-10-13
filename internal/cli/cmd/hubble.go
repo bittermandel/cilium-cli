@@ -93,11 +93,6 @@ func newCmdHubbleEnable() *cobra.Command {
 
 	for flagName := range hubble.FlagsToHelmOpts {
 		// TODO(aanm) Do not mark the flags has deprecated for now.
-		// msg := fmt.Sprintf("use --helm-set=%s<=value> instead", helmOpt)
-		// err := cmd.Flags().MarkDeprecated(flagName, msg)
-		// if err != nil {
-		// 	panic(err)
-		// }
 		hubble.FlagValues[flagName] = cmd.Flags().Lookup(flagName).Value
 	}
 
